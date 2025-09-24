@@ -4,6 +4,7 @@ import tempfile
 import re
 from pathlib import Path
 from typing import List, Dict
+from collections import Counter
 import fitz
 
 app = Flask(__name__)
@@ -56,7 +57,7 @@ def to_rgb_from_span_color(color_value):
         return (r, g, b)
     if isinstance(color_value, (list, tuple)) and len(color_value) >= 3:
         r, g, b = color_value[:3]
-        if max(r, g, b) <= 1.0:  
+        if max(r, g, b) <= 1.0:
             return (int(r*255), int(g*255), int(b*255))
         return (int(r), int(g), int(b))
     return (0, 0, 0)
@@ -96,9 +97,10 @@ def extract_green_codes_vector(pdf_path: Path) -> List[Dict]:
                             "rgb": rgb,
                             "method": "vector"
                         })
+    # Remove duplicatas (mesma página/código/bbox arredondado) antes de contar
     uniq, seen = [], set()
     for r in rows:
-        bbox = r["bbox"] or (0,0,0,0)
+        bbox = r["bbox"] or (0, 0, 0, 0)
         key = (r["page"], r["code"], tuple(round(float(x), 1) for x in bbox))
         if key in seen:
             continue
@@ -120,9 +122,18 @@ def extract_codes():
             file.save(pdf_path)
             data = extract_green_codes_vector(pdf_path)
             if not data:
-                return jsonify({'codes': []})
-            codes = sorted(set(d['code'] for d in data))
-            return jsonify({'codes': codes})
+                return jsonify({'codes': [], 'code_counts': []})
+            # Contagem por código
+            counts = Counter(d['code'] for d in data)
+            codes_sorted = sorted(counts.keys())
+            code_counts = [
+                {'code': c, 'count': counts[c]}
+                for c in sorted(counts, key=lambda c: (-counts[c], c))
+            ]
+            return jsonify({
+                'codes': codes_sorted,          # lista única (compatibilidade)
+                'code_counts': code_counts      # lista de {code, count}
+            })
     return jsonify({'error': 'Invalid file'}), 400
 
 if __name__ == '__main__':
