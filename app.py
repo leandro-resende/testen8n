@@ -1,19 +1,17 @@
-from flask import Flask, request, jsonify
-import os
-import tempfile
+import argparse
+import json
 import re
+import sys
 from pathlib import Path
-from typing import List, Dict
-from collections import Counter
-import fitz
+from typing import Dict, List, Tuple, Optional
 
-app = Flask(__name__)
+import fitz  # PyMuPDF
 
 PATTERNS = [
-    r"(?i)^\d{2,3}A\s*[-/]\s*\d{1,2}kA\s*[-/]\s*\d{1,2}[HKT]$",
-    r"(?i)^\d{2,3}\s*-\s*\d{1,2}kA\d{1,2}[HKT]$",
-    r"^\d{2,3}\s*[- ]\s*\d{2,4}$",
-    r"(?i)^[A-Z]{2,4}-\d+\s*\(\s*\d+/\d+\s*(?:\"|''|\u2033)?\s*\)$",
+    r"(?i)^\d{2,3}A\s*[-/]\s*\d{1,2}kA\s*[-/]\s*\d{1,2}[HKT]$",  # 100A/10KA/1H
+    r"(?i)^\d{2,3}\s*-\s*\d{1,2}kA\d{1,2}[HKT]$",               # 100-10KA1H
+    r"^\d{2,3}\s*[- ]\s*\d{2,4}$",                              # 10-150, 11 300
+    r"(?i)^[A-Z]{2,4}-\d+\s*\(\s*\d+/\d+\s*(?:\"|''|\u2033)?\s*\)$",  # AM-50 (3/8")
     r"(?i)^(?:AM|BM|CM)-\d+\s*\(\s*\d+/\d+\s*(?:\"|''|\u2033)?\s*\)\s+ABN-\d+\(\d+\)$",
     r"(?i)^ABCN-\s*\d+(?:/\d+)?\s*(?:CA)?\s*\(\s*\d+(?:/\d+)?\s*(?:CA)?\s*\)$",
     r"(?i)^ABN(?:-\s*\d+)?\s*(?:CA)?\s*\(\s*\d+(?:/\d+)?\s*(?:CA)?\s*\)(?:\s*\(\s*\d+\s*\))?$",
@@ -43,11 +41,13 @@ PATTERNS = [
 ]
 COMPILED = [re.compile(p) for p in PATTERNS]
 
+
 def looks_like_code(text: str) -> bool:
     t = (text or "").strip()
     if not t:
         return False
     return any(rx.search(t) for rx in COMPILED)
+
 
 def to_rgb_from_span_color(color_value):
     if isinstance(color_value, int):
@@ -62,13 +62,16 @@ def to_rgb_from_span_color(color_value):
         return (int(r), int(g), int(b))
     return (0, 0, 0)
 
+
 def is_green(rgb, g_min=110, delta=20):
     r, g, b = rgb
     return (g > g_min) and (g > r + delta) and (g > b + delta)
 
+
 def extract_green_codes_vector(pdf_path: Path) -> List[Dict]:
     doc = fitz.open(pdf_path)
-    rows = []
+    rows: List[Dict] = []
+
     for pno, page in enumerate(doc, start=1):
         data = page.get_text("dict")
         for block in data.get("blocks", []):
@@ -77,16 +80,22 @@ def extract_green_codes_vector(pdf_path: Path) -> List[Dict]:
                     rgb = to_rgb_from_span_color(span.get("color", 0))
                     if not is_green(rgb):
                         continue
+
                     text = span.get("text", "").strip()
                     if not text:
                         continue
+
+                    # tokens ajudam a capturar subcódigos; mantemos simples
                     tokens = re.findall(r"[A-Z0-9()\-]+", text)
+
                     candidates: List[str] = []
                     if looks_like_code(text):
                         candidates.append(text)
+
                     for tok in tokens:
                         if tok not in candidates and looks_like_code(tok):
                             candidates.append(tok)
+
                     for tok in candidates:
                         rows.append({
                             "file": pdf_path.name,
@@ -97,7 +106,8 @@ def extract_green_codes_vector(pdf_path: Path) -> List[Dict]:
                             "rgb": rgb,
                             "method": "vector"
                         })
-    # Remove duplicatas (mesma página/código/bbox arredondado) antes de contar
+
+    # dedupe apenas repetições idênticas na MESMA posição
     uniq, seen = [], set()
     for r in rows:
         bbox = r["bbox"] or (0, 0, 0, 0)
@@ -106,35 +116,45 @@ def extract_green_codes_vector(pdf_path: Path) -> List[Dict]:
             continue
         seen.add(key)
         uniq.append(r)
+
     doc.close()
     return uniq
 
-@app.route('/extract', methods=['POST'])
-def extract_codes():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-    if file and file.filename.lower().endswith('.pdf'):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            pdf_path = Path(tmpdir) / file.filename
-            file.save(pdf_path)
-            data = extract_green_codes_vector(pdf_path)
-            if not data:
-                return jsonify({'codes': [], 'code_counts': []})
-            # Contagem por código
-            counts = Counter(d['code'] for d in data)
-            codes_sorted = sorted(counts.keys())
-            code_counts = [
-                {'code': c, 'count': counts[c]}
-                for c in sorted(counts, key=lambda c: (-counts[c], c))
-            ]
-            return jsonify({
-                'codes': codes_sorted,          # lista única (compatibilidade)
-                'code_counts': code_counts      # lista de {code, count}
-            })
-    return jsonify({'error': 'Invalid file'}), 400
 
-if __name__ == '__main__':
-    app.run(debug=True)
+def process_pdf(pdf_path: Path) -> List[str]:
+    """
+    Retorna os códigos ENCONTRADOS (com repetições preservadas entre spans diferentes).
+    Sem prints.
+    """
+    data = extract_green_codes_vector(pdf_path)
+    return [d["code"] for d in data]
+
+
+def initial_sweep(inbox: Path, recursive: bool) -> List[str]:
+    pattern = "**/*.pdf" if recursive else "*.pdf"
+    all_codes: List[str] = []
+    for pdf in sorted(inbox.glob(pattern)):
+        try:
+            all_codes.extend(process_pdf(pdf))
+        except Exception as e:
+            # Mantém a saída limpa (apenas códigos no stdout)
+            print(f"[error] processing {pdf}: {e}", file=sys.stderr)
+    return all_codes
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Extrai códigos verdes de PDFs usando apenas PyMuPDF.")
+    ap.add_argument("--inbox", type=Path, default=Path("./inbox"))
+    ap.add_argument("--recursive", action="store_true", help="processa subpastas também")
+    args = ap.parse_args()
+
+    args.inbox.mkdir(parents=True, exist_ok=True)
+
+    codes = initial_sweep(args.inbox, recursive=args.recursive)
+
+    # imprime SOMENTE os códigos (com repetições) como um array JSON
+    print(json.dumps(codes, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
