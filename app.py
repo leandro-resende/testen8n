@@ -121,13 +121,29 @@ def extract_green_codes_vector(pdf_path: Path) -> List[Dict]:
     return uniq
 
 
+# --- NOVO: normalização para retirar o que vem nos parênteses ---
+_PARENS_RE = re.compile(r"\([^)]*\)")
+
+def normalize_code(code: str) -> str:
+    """
+    Remove grupos entre parênteses, compacta espaços
+    e limpa pontuação solta no final (espaço, ponto, hífen, parêntese).
+    Exemplos: 'U3(1)' -> 'U3', 'CE1(2).CE3(1)' -> 'CE1.CE3'
+    """
+    s = _PARENS_RE.sub("", code)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"[ .\-\(]+$", "", s)  # limpa sobras no final
+    return s
+# -----------------------------------------------------------------
+
+
 def process_pdf(pdf_path: Path) -> List[str]:
     """
-    Retorna os códigos ENCONTRADOS (com repetições preservadas entre spans diferentes).
-    Sem prints.
+    Retorna os códigos ENCONTRADOS (com repetições preservadas entre spans diferentes),
+    já normalizados sem conteúdos entre parênteses. Sem prints.
     """
     data = extract_green_codes_vector(pdf_path)
-    return [d["code"] for d in data]
+    return [normalize_code(d["code"]) for d in data]
 
 
 def initial_sweep(inbox: Path, recursive: bool) -> List[str]:
