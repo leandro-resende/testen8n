@@ -4,6 +4,13 @@ import re
 import sys
 from pathlib import Path
 import fitz  # PyMuPDF
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.get("/")
+def health():
+    return "ok"
 
 PATTERNS = [
     r"(?i)^\d{2,3}A\s*[-/]\s*\d{1,2}kA\s*[-/]\s*\d{1,2}[HKT]$",
