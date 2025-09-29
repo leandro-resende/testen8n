@@ -1,17 +1,11 @@
-import argparse
-import json
+# app.py
+from flask import Flask, request, jsonify
 import re
-import sys
-from pathlib import Path
 import fitz  # PyMuPDF
-from flask import Flask
 
 app = Flask(__name__)
 
-@app.get("/")
-def health():
-    return "ok"
-
+# ====== Regras (mesmas do seu extrator enxuto) ======
 PATTERNS = [
     r"(?i)^\d{2,3}A\s*[-/]\s*\d{1,2}kA\s*[-/]\s*\d{1,2}[HKT]$",
     r"(?i)^\d{2,3}\s*-\s*\d{1,2}kA\d{1,2}[HKT]$",
@@ -71,8 +65,8 @@ def normalize_code(code: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return re.sub(r"[ .\-\(]+$", "", s)
 
-def extract_codes(pdf_path: Path):
-    doc = fitz.open(pdf_path)
+def extract_codes_from_stream(pdf_bytes: bytes):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     rows, seen = [], set()
     for pno, page in enumerate(doc, 1):
         for block in page.get_text("dict").get("blocks", []):
@@ -98,24 +92,22 @@ def extract_codes(pdf_path: Path):
                         rows.append(normalize_code(c))
     doc.close()
     return rows
+# ====================================================
 
-def initial_sweep(inbox: Path, recursive: bool):
-    pattern = "**/*.pdf" if recursive else "*.pdf"
-    out = []
-    for pdf in sorted(inbox.glob(pattern)):
-        try:
-            out.extend(extract_codes(pdf))
-        except Exception as e:
-            print(f"[error] processing {pdf}: {e}", file=sys.stderr)
-    return out
+@app.get("/")
+def health():
+    return "ok"
 
-def main():
-    ap = argparse.ArgumentParser(description="Extrai códigos verdes de PDFs com PyMuPDF.")
-    ap.add_argument("--inbox", type=Path, default=Path("./inbox"))
-    ap.add_argument("--recursive", action="store_true", help="processa subpastas também")
-    args = ap.parse_args()
-    args.inbox.mkdir(parents=True, exist_ok=True)
-    print(json.dumps(initial_sweep(args.inbox, args.recursive), ensure_ascii=False))
+@app.post("/extract")
+def extract():
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify(error="missing file field 'file'"), 400
+    try:
+        pdf_bytes = f.read()
+        codes = extract_codes_from_stream(pdf_bytes)
+        return jsonify(codes=codes)
+    except Exception as e:
+        return jsonify(error=str(e)), 500
 
-if __name__ == "__main__":
-    main()
+# Para rodar local: gunicorn app:app -b 0.0.0.0:8000
