@@ -1,11 +1,17 @@
-import argparse
+import os
 import json
 import re
 import sys
+import tempfile
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List
 
 import fitz  # PyMuPDF
+from flask import Flask, request, jsonify, Response
+
+app = Flask(__name__)
+
+# ------------------- Seu código (inalterado na essência) -------------------
 
 PATTERNS = [
     r"(?i)^\d{2,3}A\s*[-/]\s*\d{1,2}kA\s*[-/]\s*\d{1,2}[HKT]$",  # 100A/10KA/1H
@@ -85,7 +91,6 @@ def extract_green_codes_vector(pdf_path: Path) -> List[Dict]:
                     if not text:
                         continue
 
-                    # tokens ajudam a capturar subcódigos; mantemos simples
                     tokens = re.findall(r"[A-Z0-9()\-]+", text)
 
                     candidates: List[str] = []
@@ -121,7 +126,6 @@ def extract_green_codes_vector(pdf_path: Path) -> List[Dict]:
     return uniq
 
 
-# --- NOVO: normalização para retirar o que vem nos parênteses ---
 _PARENS_RE = re.compile(r"\([^)]*\)")
 
 def normalize_code(code: str) -> str:
@@ -132,16 +136,11 @@ def normalize_code(code: str) -> str:
     """
     s = _PARENS_RE.sub("", code)
     s = re.sub(r"\s+", " ", s).strip()
-    s = re.sub(r"[ .\-\(]+$", "", s)  # limpa sobras no final
+    s = re.sub(r"[ .\-\(]+$", "", s)
     return s
-# -----------------------------------------------------------------
 
 
 def process_pdf(pdf_path: Path) -> List[str]:
-    """
-    Retorna os códigos ENCONTRADOS (com repetições preservadas entre spans diferentes),
-    já normalizados sem conteúdos entre parênteses. Sem prints.
-    """
     data = extract_green_codes_vector(pdf_path)
     return [normalize_code(d["code"]) for d in data]
 
@@ -153,24 +152,79 @@ def initial_sweep(inbox: Path, recursive: bool) -> List[str]:
         try:
             all_codes.extend(process_pdf(pdf))
         except Exception as e:
-            # Mantém a saída limpa (apenas códigos no stdout)
             print(f"[error] processing {pdf}: {e}", file=sys.stderr)
     return all_codes
 
+# ------------------- Rotas Flask -------------------
 
-def main():
-    ap = argparse.ArgumentParser(description="Extrai códigos verdes de PDFs usando apenas PyMuPDF.")
-    ap.add_argument("--inbox", type=Path, default=Path("./inbox"))
-    ap.add_argument("--recursive", action="store_true", help="processa subpastas também")
-    args = ap.parse_args()
+@app.get("/healthz")
+def healthz():
+    return "ok", 200
 
-    args.inbox.mkdir(parents=True, exist_ok=True)
+@app.get("/")
+def root():
+    return jsonify({
+        "status": "ok",
+        "endpoints": {
+            "health": "GET /healthz",
+            "upload_and_process": "POST /process (multipart form-data; campo 'files')",
+            "process_inbox": "GET /process-inbox?recursive=true|false"
+        }
+    })
 
-    codes = initial_sweep(args.inbox, recursive=args.recursive)
+@app.post("/process")
+def process_uploads():
+    """
+    Envie PDFs via multipart:
+      files=@ex1.pdf files=@ex2.pdf
+    Query:
+      raw=true -> responde apenas o array JSON (compatível com seu CLI)
+    """
+    if "files" not in request.files:
+        return jsonify({"error": "Envie pelo menos um arquivo no campo 'files'."}), 400
 
-    # imprime SOMENTE os códigos (com repetições) como um array JSON
-    print(json.dumps(codes, ensure_ascii=False))
+    codes: List[str] = []
+    # usa um diretório temporário por requisição
+    with tempfile.TemporaryDirectory() as td:
+        tdir = Path(td)
+        for f in request.files.getlist("files"):
+            if not f.filename.lower().endswith(".pdf"):
+                continue
+            dst = tdir / f.filename
+            f.save(dst)
+            codes.extend(process_pdf(dst))
 
+    if request.args.get("raw", "").lower() in ("1", "true", "yes"):
+        return Response(json.dumps(codes, ensure_ascii=False),
+                        mimetype="application/json")
 
+    return jsonify({"codes": codes, "count": len(codes)})
+
+@app.get("/process-inbox")
+def process_inbox():
+    """
+    Processa a pasta INBOX_DIR (padrão ./inbox).
+    Query:
+      recursive=true para incluir subpastas
+      raw=true para devolver apenas o array JSON
+    """
+    recursive = request.args.get("recursive", "").lower() in ("1", "true", "yes")
+    inbox_dir = Path(os.environ.get("INBOX_DIR", "./inbox"))
+    inbox_dir.mkdir(parents=True, exist_ok=True)
+
+    codes = initial_sweep(inbox_dir, recursive=recursive)
+
+    if request.args.get("raw", "").lower() in ("1", "true", "yes"):
+        return Response(json.dumps(codes, ensure_ascii=False),
+                        mimetype="application/json")
+
+    return jsonify({
+        "inbox": str(inbox_dir),
+        "recursive": recursive,
+        "count": len(codes),
+        "codes": codes
+    })
+
+# Execução local (útil para testar fora do Render)
 if __name__ == "__main__":
-    main()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
