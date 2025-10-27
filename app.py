@@ -37,6 +37,7 @@ PATTERNS = [
     r"^T(?:E|\d)(?:\(\d+\))?$",
     r"^U\d(?:\.\d+)?(?:\(\d+\))?$",
     r"^N(?:\d+(?:\.\d+)?)?(?:\(\d+\))?$"
+    r"^(?:[A-Z]{1,3}(?:\d+(?:\.\d+)?(?:\(\d+\))?|\(\d+\))){2,}$"
 ]
 COMPILED = [re.compile(p) for p in PATTERNS]
 _PARENS_RE = re.compile(r"\([^)]*\)")
@@ -111,3 +112,4 @@ def extract():
         return jsonify(error=str(e)), 500
 
 # Para rodar local: gunicorn app:app -b 0.0.0.0:8000
+
