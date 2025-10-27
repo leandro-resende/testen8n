@@ -68,9 +68,20 @@ def normalize_code(code: str) -> str:
     return re.sub(r"[ .\-\(]+$", "", s)
 
 # --- FUNÇÃO MODIFICADA ---
+# --- FUNÇÃO MODIFICADA ---
 def extract_codes_from_stream(pdf_bytes: bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     rows, seen = [], set()
+    
+    # Regex para códigos concatenados (ex: TEU3, S1NS3R)
+    # Define os "inícios" prováveis de um código (A, B, C, I, M, N, S, T, U)
+    # Isso irá dividir "TEU3" em ["TE", "U3"]
+    # e "S1NS3R" em ["S1N", "S3R"]
+    _SPLIT_RE = re.compile(r"(?=[ABSCIMTUN])")
+    
+    # Regex que identifica os próprios códigos concatenados (para filtragem)
+    _CONCAT_RE = re.compile(r"^(?:[A-Z]{1,3}(?:\d+(?:\.\d+)?)?(?:\(\d+\))?|\(\d+\)){2,}$")
+
     for pno, page in enumerate(doc, 1):
         for block in page.get_text("dict").get("blocks", []):
             for line in block.get("lines", []):
@@ -85,39 +96,77 @@ def extract_codes_from_stream(pdf_bytes: bytes):
                     
                     # 1. Coleta todos os tokens possíveis
                     all_possible_tokens: Set[str] = set()
-                    all_possible_tokens.add(text) # Adiciona o texto do span inteiro
                     
-                    # 2. Adiciona tokens básicos (ex: "TE(1)U3(2)")
+                    # Adiciona o texto do span inteiro (ex: "TEU3")
+                    all_possible_tokens.add(text) 
+                    
+                    # Adiciona tokens básicos (ex: se o texto for "TE U3", pega "TE" e "U3")
                     tokens_base = _TOKEN_RE.findall(text)
                     all_possible_tokens.update(tokens_base)
 
-                    # 3. Divide tokens concatenados (ex: "TE(1)U3(2)" -> "TE(1)", "U3(2)")
-                    for t in tokens_base:
-                        # Usa lookbehind para dividir depois de ')' se for seguido por uma letra
-                        sub_tokens = re.split(r"(?<=\))\s*(?=[A-Z])", t)
-                        if len(sub_tokens) > 1:
-                            all_possible_tokens.update(sub_tokens)
-                    
-                    # 4. Valida todos os candidatos encontrados
-                    candidates: List[str] = []
+                    # 3. Divide tokens concatenados
+                    # Itera sobre uma cópia para poder modificar o set
+                    for t in list(all_possible_tokens): 
+                        # Primeiro, divide TE(1)U3(2) -> ["TE(1)", "U3(2)"]
+                        sub_tokens_parens = re.split(r"(?<=\))\s*(?=[A-Z])", t)
+                        
+                        for st in sub_tokens_parens:
+                            # Segundo, divide TEU3 -> ["TE", "U3"]
+                            # e S1NS3R -> ["S1N", "S3R"]
+                            sub_tokens_split = _SPLIT_RE.split(st)
+                            # Adiciona as partes (remove strings vazias do split)
+                            all_possible_tokens.update(p for p in sub_tokens_split if p)
+
+                    # 4. Valida todos os candidatos
+                    raw_candidates = []
                     for tok in all_possible_tokens:
-                        if tok not in candidates and looks_like_code(tok):
-                            candidates.append(tok)
+                        tok = tok.strip()
+                        if tok and tok not in raw_candidates and looks_like_code(tok):
+                            raw_candidates.append(tok)
+
+                    # 5. Lógica de Preferência (Filtrar concatenados)
+                    # Se encontramos 'TE', 'U3' E 'TEU3', queremos remover 'TEU3'.
+                    
+                    # Encontra todas as "bases" válidas (ex: 'TE', 'U3')
+                    bases_found = set()
+                    for cand in raw_candidates:
+                        if not _CONCAT_RE.search(cand):
+                            bases_found.add(cand)
+
+                    final_candidates = []
+                    for cand in raw_candidates:
+                        # Se for um código concatenado (ex: 'TEU3')
+                        if _CONCAT_RE.search(cand):
+                            # Divide ele (ex: ['TE', 'U3'])
+                            parts = [p.strip() for p in _SPLIT_RE.split(cand) if p.strip()]
+                            
+                            # Se TODAS as suas partes (TE, U3) tbm foram encontradas como bases...
+                            if parts and all(p in bases_found for p in parts):
+                                # Ignora o código 'TEU3'
+                                continue 
+                            else:
+                                final_candidates.append(cand) # Mantém
+                        else:
+                            final_candidates.append(cand) # É uma base, mantém
+                            
+                    candidates = final_candidates
                     # --- FIM DA ALTERAÇÃO ---
 
                     bbox = tuple(round(float(x), 1) for x in (span.get("bbox") or (0, 0, 0, 0)))
                     for c in candidates:
-                        key = (pno, c, bbox)
+                        # 'c' é o código antes da normalização (ex: "TE(1)")
+                        key = (pno, c, bbox) 
                         if key in seen:
                             continue
                         seen.add(key)
                         
-                        # A sua função normalize_code() já remove os parênteses
-                        rows.append(normalize_code(c))
+                        # Adiciona o código normalizado (ex: "TE")
+                        rows.append(normalize_code(c)) 
+                        
     doc.close()
     
-    # Retorna apenas os códigos únicos normalizados
-    return sorted(list(set(rows)))
+    # PROBLEMA 2 CORRIGIDO: Retorna a lista 'rows' completa, sem deduplicar
+    return rows
 # ====================================================
 
 @app.get("/")
@@ -137,3 +186,4 @@ def extract():
         return jsonify(error=str(e)), 500
 
 # Para rodar local: gunicorn app:app -b 0.0.0.0:8000
+
