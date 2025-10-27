@@ -2,6 +2,7 @@
 from flask import Flask, request, jsonify
 import re
 import fitz  # PyMuPDF
+from typing import List, Set
 
 app = Flask(__name__)
 
@@ -31,16 +32,17 @@ PATTERNS = [
     r"^I\d\(\d+\)$",
     r"^M\d(?:\.\d+)?(?:\(\d+\))?$",
     r"^(?:[A-Z]{1,3}(?:\d+(?:\.\d+)?)?(?:\(\d+\))?)(?:[ .-]{1,2}[A-Z]{1,3}(?:\d+(?:\.\d+)?)?(?:\(\d+\))?)+$",
+    # r"^(?:[A-Z]{1,3}\d+(?:\.\d+)?(?:\(\d+\))?){2,}$", # Redundante com o de baixo
     r"^S[A-Z0-9]+(?:\([A-Z0-9]+\))?$",
     r"^S(?:[A-Z0-9]+(?:\([A-Z0-9]+\))?)+(?:[ .-]S(?:[A-Z0-9]+(?:\([A-Z0-9]+\))?)+)*$",
     r"^T(?:E|\d)(?:\(\d+\))?$",
     r"^U\d(?:\.\d+)?(?:\(\d+\))?$",
-    r"^N(?:\d+(?:\.\d+)?)?(?:\(\d+\))?$"
+    r"^N(?:\d+(?:\.\d+)?)?(?:\(\d+\))?$", # <-- VÍRGULA ADICIONADA AQUI
     r"^(?:[A-Z]{1,3}(?:\d+(?:\.\d+)?(?:\(\d+\))?|\(\d+\))){2,}$"
 ]
 COMPILED = [re.compile(p) for p in PATTERNS]
 _PARENS_RE = re.compile(r"\([^)]*\)")
-_TOKEN_RE = re.compile(r"[A-Z0-9()\-]+")
+_TOKEN_RE = re.compile(r"[A-Z0-9()/.\\\"''\u2033-]+") # Regex de token ajustado (similar ao script original)
 
 def looks_like_code(s: str) -> bool:
     s = (s or "").strip()
@@ -65,6 +67,7 @@ def normalize_code(code: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return re.sub(r"[ .\-\(]+$", "", s)
 
+# --- FUNÇÃO MODIFICADA ---
 def extract_codes_from_stream(pdf_bytes: bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     rows, seen = [], set()
@@ -77,21 +80,44 @@ def extract_codes_from_stream(pdf_bytes: bytes):
                     text = (span.get("text") or "").strip()
                     if not text:
                         continue
-                    candidates = []
-                    if looks_like_code(text):
-                        candidates.append(text)
-                    for tok in _TOKEN_RE.findall(text):
+                    
+                    # --- INÍCIO DA ALTERAÇÃO ---
+                    
+                    # 1. Coleta todos os tokens possíveis
+                    all_possible_tokens: Set[str] = set()
+                    all_possible_tokens.add(text) # Adiciona o texto do span inteiro
+                    
+                    # 2. Adiciona tokens básicos (ex: "TE(1)U3(2)")
+                    tokens_base = _TOKEN_RE.findall(text)
+                    all_possible_tokens.update(tokens_base)
+
+                    # 3. Divide tokens concatenados (ex: "TE(1)U3(2)" -> "TE(1)", "U3(2)")
+                    for t in tokens_base:
+                        # Usa lookbehind para dividir depois de ')' se for seguido por uma letra
+                        sub_tokens = re.split(r"(?<=\))\s*(?=[A-Z])", t)
+                        if len(sub_tokens) > 1:
+                            all_possible_tokens.update(sub_tokens)
+                    
+                    # 4. Valida todos os candidatos encontrados
+                    candidates: List[str] = []
+                    for tok in all_possible_tokens:
                         if tok not in candidates and looks_like_code(tok):
                             candidates.append(tok)
+                    # --- FIM DA ALTERAÇÃO ---
+
                     bbox = tuple(round(float(x), 1) for x in (span.get("bbox") or (0, 0, 0, 0)))
                     for c in candidates:
                         key = (pno, c, bbox)
                         if key in seen:
                             continue
                         seen.add(key)
+                        
+                        # A sua função normalize_code() já remove os parênteses
                         rows.append(normalize_code(c))
     doc.close()
-    return rows
+    
+    # Retorna apenas os códigos únicos normalizados
+    return sorted(list(set(rows)))
 # ====================================================
 
 @app.get("/")
@@ -111,5 +137,3 @@ def extract():
         return jsonify(error=str(e)), 500
 
 # Para rodar local: gunicorn app:app -b 0.0.0.0:8000
-
-
