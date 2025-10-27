@@ -2,11 +2,12 @@
 from flask import Flask, request, jsonify
 import re
 import fitz  # PyMuPDF
-from typing import List, Set
+from typing import List, Tuple
+import pandas as pd  # <-- NOVA DEPENDÊNCIA
 
 app = Flask(__name__)
 
-# ====== Regras (mesmas do seu extrator enxuto) ======
+# ====== Regras (copiadas do seu script local) ======
 PATTERNS = [
     r"(?i)^\d{2,3}A\s*[-/]\s*\d{1,2}kA\s*[-/]\s*\d{1,2}[HKT]$",
     r"(?i)^\d{2,3}\s*-\s*\d{1,2}kA\d{1,2}[HKT]$",
@@ -32,141 +33,137 @@ PATTERNS = [
     r"^I\d\(\d+\)$",
     r"^M\d(?:\.\d+)?(?:\(\d+\))?$",
     r"^(?:[A-Z]{1,3}(?:\d+(?:\.\d+)?)?(?:\(\d+\))?)(?:[ .-]{1,2}[A-Z]{1,3}(?:\d+(?:\.\d+)?)?(?:\(\d+\))?)+$",
-    # r"^(?:[A-Z]{1,3}\d+(?:\.\d+)?(?:\(\d+\))?){2,}$", # Redundante com o de baixo
     r"^S[A-Z0-9]+(?:\([A-Z0-9]+\))?$",
     r"^S(?:[A-Z0-9]+(?:\([A-Z0-9]+\))?)+(?:[ .-]S(?:[A-Z0-9]+(?:\([A-Z0-9]+\))?)+)*$",
     r"^T(?:E|\d)(?:\(\d+\))?$",
     r"^U\d(?:\.\d+)?(?:\(\d+\))?$",
-    r"^N(?:\d+(?:\.\d+)?)?(?:\(\d+\))?$", # <-- VÍRGULA ADICIONADA AQUI
-    r"^(?:[A-Z]{1,3}(?:\d+(?:\.\d+)?(?:\(\d+\))?|\(\d+\))){2,}$"
+    r"^N(?:\d+(?:\.\d+)?)?(?:\(\d+\))?$"
 ]
 COMPILED = [re.compile(p) for p in PATTERNS]
-_PARENS_RE = re.compile(r"\([^)]*\)")
-_TOKEN_RE = re.compile(r"[A-Z0-9()/.\\\"''\u2033-]+") # Regex de token ajustado (similar ao script original)
 
-def looks_like_code(s: str) -> bool:
-    s = (s or "").strip()
-    return bool(s) and any(rx.search(s) for rx in COMPILED)
+def looks_like_code(text: str) -> bool:
+    """Verifica se o texto parece um código válido."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    return any(rx.search(t) for rx in COMPILED)
 
-def to_rgb(c):
-    if isinstance(c, int):
-        return ((c >> 16) & 255, (c >> 8) & 255, c & 255)
-    if isinstance(c, (list, tuple)) and len(c) >= 3:
-        r, g, b = c[:3]
-        if max(r, g, b) <= 1.0:
-            return (int(r * 255), int(g * 255), int(b * 255))
+def to_rgb(color_value):
+    """Converte o valor de cor do span para (R, G, B)."""
+    if isinstance(color_value, int):
+        r = (color_value >> 16) & 255
+        g = (color_value >> 8) & 255
+        b = color_value & 255
+        return (r, g, b)
+    if isinstance(color_value, (list, tuple)) and len(color_value) >= 3:
+        r, g, b = color_value[:3]
+        if max(r, g, b) <= 1.0:  
+            return (int(r*255), int(g*255), int(b*255))
         return (int(r), int(g), int(b))
     return (0, 0, 0)
 
-def is_green(rgb, g_min=110, d=20):
+def is_green(rgb, g_min=110, delta=20):
+    """Verifica se a cor RGB é verde."""
     r, g, b = rgb
-    return (g > g_min) and (g > r + d) and (g > b + d)
+    return (g > g_min) and (g > r + delta) and (g > b + delta)
 
-def normalize_code(code: str) -> str:
-    s = _PARENS_RE.sub("", code)
-    s = re.sub(r"\s+", " ", s).strip()
-    return re.sub(r"[ .\-\(]+$", "", s)
 
-# --- FUNÇÃO MODIFICADA ---
-# --- FUNÇÃO MODIFICADA ---
-def extract_codes_from_stream(pdf_bytes: bytes):
+def extract_codes_from_bytes(pdf_bytes: bytes) -> pd.DataFrame:
+    """
+    Função principal de extração, adaptada de 'extract_green_codes_vector'
+    para aceitar bytes de PDF em vez de um caminho de arquivo.
+    """
+    # Abre o PDF a partir dos bytes recebidos
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    rows, seen = [], set()
     
-    # Regex para códigos concatenados (ex: TEU3, S1NS3R)
-    # Define os "inícios" prováveis de um código (A, B, C, I, M, N, S, T, U)
-    # Isso irá dividir "TEU3" em ["TE", "U3"]
-    # e "S1NS3R" em ["S1N", "S3R"]
-    _SPLIT_RE = re.compile(r"(?=[ABSCIMTUN])")
-    
-    # Regex que identifica os próprios códigos concatenados (para filtragem)
-    _CONCAT_RE = re.compile(r"^(?:[A-Z]{1,3}(?:\d+(?:\.\d+)?)?(?:\(\d+\))?|\(\d+\)){2,}$")
-
-    for pno, page in enumerate(doc, 1):
-        for block in page.get_text("dict").get("blocks", []):
+    rows = []
+    for pno, page in enumerate(doc, start=1):
+        data = page.get_text("dict")
+        for block in data.get("blocks", []):
             for line in block.get("lines", []):
                 for span in line.get("spans", []):
-                    if not is_green(to_rgb(span.get("color", 0))):
+                    rgb = to_rgb(span.get("color", 0))
+                    if not is_green(rgb):
                         continue
-                    text = (span.get("text") or "").strip()
+                    text = span.get("text", "").strip()
                     if not text:
                         continue
                     
-                    # --- INÍCIO DA ALTERAÇÃO ---
+                    # --- INÍCIO DA LÓGICA DO SCRIPT LOCAL ---
+                    tokens_base = re.findall(r"[A-Z0-9()/.\\\"''\u2033-]+", text)
                     
-                    # 1. Coleta todos os tokens possíveis
-                    all_possible_tokens: Set[str] = set()
-                    
-                    # Adiciona o texto do span inteiro (ex: "TEU3")
-                    all_possible_tokens.add(text) 
-                    
-                    # Adiciona tokens básicos (ex: se o texto for "TE U3", pega "TE" e "U3")
-                    tokens_base = _TOKEN_RE.findall(text)
-                    all_possible_tokens.update(tokens_base)
+                    tokens_split: List[str] = []
+                    for t in tokens_base:
+                        sub_tokens = re.split(r"(?<=\))\s*(?=[A-Z])", t)
+                        tokens_split.extend(sub_tokens)
 
-                    # 3. Divide tokens concatenados
-                    # Itera sobre uma cópia para poder modificar o set
-                    for t in list(all_possible_tokens): 
-                        # Primeiro, divide TE(1)U3(2) -> ["TE(1)", "U3(2)"]
-                        sub_tokens_parens = re.split(r"(?<=\))\s*(?=[A-Z])", t)
-                        
-                        for st in sub_tokens_parens:
-                            # Segundo, divide TEU3 -> ["TE", "U3"]
-                            # e S1NS3R -> ["S1N", "S3R"]
-                            sub_tokens_split = _SPLIT_RE.split(st)
-                            # Adiciona as partes (remove strings vazias do split)
-                            all_possible_tokens.update(p for p in sub_tokens_split if p)
-
-                    # 4. Valida todos os candidatos
-                    raw_candidates = []
+                    all_possible_tokens = set(tokens_base + tokens_split)
+                    
+                    raw_candidates: List[str] = []
+                    if looks_like_code(text):
+                        raw_candidates.append(text)
+                    
                     for tok in all_possible_tokens:
-                        tok = tok.strip()
-                        if tok and tok not in raw_candidates and looks_like_code(tok):
-                            raw_candidates.append(tok)
+                        if not tok: 
+                            continue
+                        
+                        base_tok = re.sub(r"\([\s\d/\"'CA]+\)$", "", tok).strip()
 
-                    # 5. Lógica de Preferência (Filtrar concatenados)
-                    # Se encontramos 'TE', 'U3' E 'TEU3', queremos remover 'TEU3'.
+                        if tok not in raw_candidates and looks_like_code(tok):
+                            raw_candidates.append(tok)
+                        
+                        if base_tok and base_tok != tok and base_tok not in raw_candidates and looks_like_code(base_tok):
+                            raw_candidates.append(base_tok)
                     
-                    # Encontra todas as "bases" válidas (ex: 'TE', 'U3')
                     bases_found = set()
                     for cand in raw_candidates:
-                        if not _CONCAT_RE.search(cand):
+                        base_match = re.sub(r"\([\s\d/\"'CA]+\)$", "", cand).strip()
+                        if base_match == cand and looks_like_code(cand):
                             bases_found.add(cand)
 
                     final_candidates = []
                     for cand in raw_candidates:
-                        # Se for um código concatenado (ex: 'TEU3')
-                        if _CONCAT_RE.search(cand):
-                            # Divide ele (ex: ['TE', 'U3'])
-                            parts = [p.strip() for p in _SPLIT_RE.split(cand) if p.strip()]
-                            
-                            # Se TODAS as suas partes (TE, U3) tbm foram encontradas como bases...
-                            if parts and all(p in bases_found for p in parts):
-                                # Ignora o código 'TEU3'
-                                continue 
-                            else:
-                                final_candidates.append(cand) # Mantém
-                        else:
-                            final_candidates.append(cand) # É uma base, mantém
-                            
-                    candidates = final_candidates
-                    # --- FIM DA ALTERAÇÃO ---
-
-                    bbox = tuple(round(float(x), 1) for x in (span.get("bbox") or (0, 0, 0, 0)))
-                    for c in candidates:
-                        # 'c' é o código antes da normalização (ex: "TE(1)")
-                        key = (pno, c, bbox) 
-                        if key in seen:
-                            continue
-                        seen.add(key)
+                        base_tok = re.sub(r"\([\s\d/\"'CA]+\)$", "", cand).strip()
                         
-                        # Adiciona o código normalizado (ex: "TE")
-                        rows.append(normalize_code(c)) 
+                        if base_tok != cand: 
+                            if base_tok in bases_found:
+                                continue
+                            else:
+                                final_candidates.append(cand)
+                        else:
+                            final_candidates.append(cand)
+                    
+                    candidates = sorted(list(set(final_candidates)))
+                    
+                    # --- FIM DA LÓGICA DO SCRIPT LOCAL ---
+
+                    for tok in candidates:
+                        rows.append({
+                            # "file" é irrelevante aqui, pois não temos nome de arquivo
+                            "page": pno,
+                            "code": tok,
+                            "span_text": text,
+                            "bbox": span.get("bbox", None),
+                            "rgb": rgb,
+                            "method": "vector"
+                        })
                         
     doc.close()
+
+    # Deduplicação (do script local)
+    uniq, seen = [], set()
+    for r in rows:
+        bbox = r["bbox"] or (0,0,0,0)
+        key = (r["page"], r["code"], tuple(round(float(x), 1) for x in bbox))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(r)
     
-    # PROBLEMA 2 CORRIGIDO: Retorna a lista 'rows' completa, sem deduplicar
-    return rows
+    return pd.DataFrame(uniq)
+
+# ====================================================
+# --- Endpoints da API ---
 # ====================================================
 
 @app.get("/")
@@ -175,15 +172,31 @@ def health():
 
 @app.post("/extract")
 def extract():
+    """
+    Recebe o arquivo 'file' do N8N, processa usando a nova lógica
+    e retorna uma lista simples de códigos.
+    """
     f = request.files.get("file")
     if not f or not f.filename:
         return jsonify(error="missing file field 'file'"), 400
+    
     try:
         pdf_bytes = f.read()
-        codes = extract_codes_from_stream(pdf_bytes)
-        return jsonify(codes=codes)
+        
+        # 1. Chama a função de extração adaptada
+        df_codes = extract_codes_from_bytes(pdf_bytes)
+        
+        # 2. Converte a coluna 'code' do DataFrame para uma lista
+        codes_list = []
+        if not df_codes.empty:
+            # Pega apenas a coluna 'code' e converte para lista
+            codes_list = df_codes["code"].tolist() 
+            
+        # 3. Retorna a lista de códigos, como o N8N espera
+        return jsonify(codes=codes_list)
+    
     except Exception as e:
-        return jsonify(error=str(e)), 500
+        # Adiciona 'str(e)' para mais detalhes do erro no log
+        return jsonify(error=f"Internal server error: {str(e)}"), 500
 
-# Para rodar local: gunicorn app:app -b 0.0.0.0:8000
-
+# (Não é necessário 'gunicorn' aqui, pois o Render usa seu próprio comando)
